@@ -1,0 +1,247 @@
+#include <RcppArmadillo.h>
+// [[Rcpp::depends(RcppArmadillo)]]
+
+#include <Rcpp.h>
+#include <omp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <iostream>
+ 
+using namespace std;
+using namespace Rcpp;
+using namespace arma;
+
+
+const double log2pi = std::log(2.0 * M_PI);
+
+
+
+//' @title
+//' getneighborhood_fast
+//' @description
+//' an efficient function to find the neighborhood based on the matrix of position and a pre-defined cutoff
+//'
+//' @param x is a n-by-2 matrix of position.
+//' @param cutoff is a threashold of Euclidean distance to decide whether a spot is an neighborhood of another spot. For example, if the Euclidean distance between spot A and B is less than cutoff, then A is taken as the neighbourhood of B. 
+//' @return A sparse matrix containing the neighbourhood
+//'
+//' @export
+// [[Rcpp::export]]
+arma::sp_umat getneighborhood_fast(const arma::mat x, double cutoff)	{
+	int N = x.n_rows;
+    arma::sp_umat D(N, N);
+    double dis;
+    uvec idx, idx2;
+	for (int j = 0; j < N-1; ++j)
+	{    
+        idx = find(abs(x(j,0) - x.col(0))<cutoff); 
+        idx2 = find(idx>j);
+        int p = idx2.n_elem;
+		for (int i = 0; i < p; ++i)
+		{
+            dis = norm(x.row(idx(idx2(i))) - x.row(j), 2);
+            if (dis < cutoff){
+                D(idx(idx2(i)),j) = 1;
+                D(j,idx(idx2(i))) = 1;
+            }
+		}
+	}
+	return D;
+}
+
+double elbo(arma::mat& U, arma::mat& gam)	{
+   return accu(U % gam) + accu(gam % log(gam + (gam==0)));
+}
+
+vec dmvnrm(const mat& x,  
+           rowvec mean,  
+           mat theta, 
+           bool logd = false,
+           int cores = 1) { 
+    omp_set_num_threads(cores);
+    int n = x.n_rows;
+    int xdim = x.n_cols;
+    vec out(n);
+    mat rooti = chol(theta, "lower");
+    double rootisum = sum(log(rooti.diag()));
+    double constants = -(xdim/2) * log2pi;
+    #pragma omp parallel for schedule(static) 
+    for (int i=0; i < n; i++) {
+        vec z = rooti * trans( x.row(i) - mean) ;    
+        out(i)      = constants - 0.5 * sum(z%z) + rootisum;     
+    }  
+      
+    if (logd==false) {
+        out=exp(out);
+    }
+    return(out);
+}
+
+sp_mat get_spNbs(ivec x, const sp_mat& Adj) {   
+// row is for pixel.
+//output a sparse matrix, i-th row contains labels of neighbor_i. 
+	// Make const iterator
+    arma::sp_mat::const_iterator start = Adj.begin();
+    //arma::sp_mat::const_iterator end   = Adj.end();
+
+    // Calculate number of nonzero points
+    //int n = std::distance(start, end);
+    int n = Adj.n_nonzero;
+    //cout << "n=" << n << endl;
+    //cout << "n=" << Adj.n_nonzero << endl;
+
+	sp_mat spNbs(x.n_elem, x.n_elem);    //neiborhood state matrix, matched with Adj.
+
+	
+	arma::sp_mat::const_iterator it = start; 
+    for(int i = 0; i < n; ++i)
+    {
+        //temp(0) = it.row();
+        //temp(1) = it.col();
+        spNbs(it.row(), it.col()) = x(it.col());
+        ++it; // increment
+    }
+	return spNbs;
+}
+
+arma::mat calXenergy2D_sp(arma::ivec x, const arma::sp_mat& Adj, int K, const arma::vec alpha, const double beta)	{
+	int n = x.n_rows;
+	arma::sp_mat spNbs = get_spNbs(x, Adj);
+	arma::sp_mat spNbs_t = spNbs.t();  // transform spNbs to iterate by column.
+	arma::mat Ux(n, K);
+	int i, k;
+	for (k = 0; k < K; k++)
+	{
+		for (i = 0; i < n; i++)
+		{
+			arma::sp_mat col(spNbs_t.col(i));
+			double n_sameS = 0;
+			//double n_nb = 0;
+			//int nn = std::distance(col.begin(), col.end());
+			int nn = col.n_nonzero;
+			for (arma::sp_mat::iterator j = col.begin(); j != col.end(); ++j) {
+				n_sameS += (*j) == (k+1);
+				//n_nb++;
+			}
+			Ux(i, k) = alpha(k) + beta * (nn - n_sameS)/2;
+			//cout << "n_nb = " << n_nb << endl;
+			//cout << "n_nb = " << n << endl;
+
+		}
+	}
+	//cout << "Ux = " << accu(Ux) << endl;
+	return Ux;
+}
+
+double obj_beta(const arma::ivec& x, const arma::mat& gam, const arma::sp_mat& Adj, const arma::mat Z, int K, const arma::vec alpha, const double beta, const double eta)	{
+  
+  mat Ux = calXenergy2D_sp(x, Adj, K, alpha, beta); // Uy was normalized, so there is no need to normalized Uy. 
+  mat pxgn1 = normalise(exp(-Ux), 1, 1); // set all rowSums to be ONE.
+  mat pxgn = (1-eta)*Z+eta*pxgn1
+  return accu(gam % (log(pxgn)));
+}
+
+
+
+Rcpp::List runICM_sp (const arma::mat &y, arma::ivec x, arma::mat mu, arma::cube theta, const arma::sp_mat& Adj, const arma::mat Z, arma::vec alpha, double beta, , const double eta, int maxIter_ICM)	{
+	int n = y.n_rows, K = mu.n_cols;
+	int iter, k;
+
+	// energy of y
+	arma::mat Uy(n, K);
+	for (k = 0; k < K; k++)	{
+		arma::vec mu_k = mu.col(k);
+		arma::mat theta_k = theta.slice(k);
+		Uy.col(k) = -dmvnrm(y, conv_to< rowvec >::from(mu_k), theta_k, true);
+	}
+
+	arma::vec Energy(maxIter_ICM);
+   	Energy(0) = INFINITY;
+   	arma::mat Ux(n, K);
+   	arma::mat U(n, K);
+	//--------------------------------------------------------------------------------	
+	// ICM algrithm
+	//--------------------------------------------------------------------------------
+	int Iteration = 1;
+	for (iter = 1; iter < maxIter_ICM; iter ++ ) {
+		
+		Ux = calXenergy2D_sp(x, Adj, K, alpha, beta);
+
+		U = Uy -log((1-eta)*Z+eta*normalise(exp(-Ux), 1, 1));
+		arma::vec Umin = min(U, 1);
+		arma::uvec x_u = index_min(U, 1);
+		x = conv_to< ivec >::from(x_u) + 1;
+
+		Energy(iter) = sum(Umin);
+		if (Energy(iter) - Energy(iter - 1) > 1e-5) {
+			cout << "diff Energy = " << Energy(iter) - Energy(iter - 1)  << endl;
+			break;
+		}
+
+		if (Energy(iter-1) - Energy(iter) < 1e-5)
+		{
+			cout << "ICM Converged at Iteration = " << iter  << endl;
+			break;
+		}
+	}
+	
+	if (iter == maxIter_ICM) {
+		Iteration = iter - 1;
+	} else {
+		Iteration = iter;
+	}
+
+	vec energy = Energy.subvec(1, Iteration);
+	arma::mat pxgn1 = normalise(exp(-Ux), 1, 1); // set all rowSums to be ONE.
+    arma::mat pxgn = (1-eta)*Z+eta*pxgn1
+
+
+	List output = List::create(
+		Rcpp::Named("x") = x,
+		Rcpp::Named("U") = U,
+		Rcpp::Named("Uy") = Uy,
+		Rcpp::Named("Ux") = Ux,
+		Rcpp::Named("pxgn") = pxgn,
+		Rcpp::Named("energy") = energy);
+
+	return output; 
+}
+
+
+
+mat runEstep(mat Uy, mat pxgn)	{
+	int n = Uy.n_rows, K = Uy.n_cols;
+	mat gam = zeros<mat>(n, K); 
+	mat dy = exp(-Uy);
+	mat gam1 = zeros<mat>(n, K); 
+	int k;
+	// compute pygn
+	for (k = 0; k < K; k ++)	{
+		gam1.col(k) = dy.col(k) % pxgn.col(k);
+	}
+	
+	vec pygn = sum(gam1, 1);
+
+	// compute gam
+	for (k = 0; k < K; k ++)	{
+		gam.col(k) = gam1.col(k)/pygn;
+	}
+	return gam;
+}
+
+
+
+//call pchisq from stat package
+List Mclust2(arma::mat y, int G){
+
+  // get namespace of package
+  Rcpp::Environment pkg = Environment::namespace_env("mclust");
+  // get function from package
+  Rcpp::Function f = pkg["Mclust"];
+  
+  return f(_["data"]=y, _["G"]=G);
+}
+
+ 
